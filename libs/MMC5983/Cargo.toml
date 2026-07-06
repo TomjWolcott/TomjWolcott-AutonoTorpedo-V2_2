@@ -1,0 +1,23 @@
+[package]
+name = "mmc5983_rs"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "A Rust library for interacting with the MMC5983 magnetometer"
+homepage = "https://docs.rs/mmc5983_rs"
+documentation = "https://docs.rs/mmc5983_rs"
+repository = "https://github.com/RaulTrombin/MMC5983-rs"
+readme = "README.md"
+categories = ["embedded"]
+keywords = ["magnetometer", "sensor", "embedded", "mmc5983", "Memsic"]
+
+
+[dependencies]
+bitflags = "2.6.0"
+embedded-hal = "1.0.0"
+embedded-hal-async = { version = "1.0.0", optional = true }
+maybe-async-cfg = "*"
+nb = "1.1.0"
+
+[features]
+async = ["dep:embedded-hal-async"]
