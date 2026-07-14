@@ -1,3 +1,4 @@
+use defmt::Format;
 use maybe_async_cfg::maybe;
 
 #[cfg(not(feature = "async"))]
@@ -71,7 +72,7 @@ impl<SPI, MODE> Mmc5983<SpiInterface<SPI>, MODE> {
     sync(cfg(not(feature = "async")), keep_self,),
     async(cfg(feature = "async"), keep_self,)
 )]
-impl<DI, CommE, MODE> Mmc5983<DI, MODE>
+impl<DI, CommE: Format, MODE> Mmc5983<DI, MODE>
 where
     DI: ReadData<Error = Error<CommE>> + WriteData<Error = Error<CommE>>,
 {
@@ -264,7 +265,7 @@ where
     sync(cfg(not(feature = "async")), keep_self,),
     async(cfg(feature = "async"), keep_self,)
 )]
-impl<DI, CommE> Mmc5983<DI, mode::Continuous>
+impl<DI, CommE: Format> Mmc5983<DI, mode::Continuous>
 where
     DI: ReadData<Error = Error<CommE>> + WriteData<Error = Error<CommE>>,
 {
@@ -275,7 +276,7 @@ where
     }
 }
 
-impl<DI, CommE> Mmc5983<DI, mode::OneShot>
+impl<DI, CommE: Format> Mmc5983<DI, mode::OneShot>
 where
     DI: ReadData<Error = Error<CommE>> + WriteData<Error = Error<CommE>>,
 {

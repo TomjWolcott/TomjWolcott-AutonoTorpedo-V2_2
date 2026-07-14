@@ -1,4 +1,6 @@
 //! I2C/SPI interfaces
+
+use defmt::Format;
 use maybe_async_cfg::maybe;
 
 #[cfg(not(feature = "async"))]
@@ -44,7 +46,7 @@ pub trait WriteData: private::Sealed {
     sync(cfg(not(feature = "async")), keep_self,),
     async(cfg(feature = "async"), keep_self,)
 )]
-impl<I2C, E> WriteData for I2cInterface<I2C>
+impl<I2C, E: Format> WriteData for I2cInterface<I2C>
 where
     I2C: i2c::I2c<Error = E>,
 {
@@ -63,7 +65,7 @@ where
     sync(cfg(not(feature = "async")), keep_self,),
     async(cfg(feature = "async"), keep_self,)
 )]
-impl<SPI, CommE> WriteData for SpiInterface<SPI>
+impl<SPI, CommE: Format> WriteData for SpiInterface<SPI>
 where
     SPI: spi::SpiDevice<u8, Error = CommE>,
 {
@@ -101,7 +103,7 @@ const SPI_RW: u8 = 1 << 7;
     sync(cfg(not(feature = "async")), keep_self,),
     async(cfg(feature = "async"), keep_self,)
 )]
-impl<I2C, E> ReadData for I2cInterface<I2C>
+impl<I2C, E: Format> ReadData for I2cInterface<I2C>
 where
     I2C: i2c::I2c<Error = E>,
 {
@@ -133,7 +135,7 @@ where
     sync(cfg(not(feature = "async")), keep_self,),
     async(cfg(feature = "async"), keep_self,)
 )]
-impl<SPI, CommE> ReadData for SpiInterface<SPI>
+impl<SPI, CommE: Format> ReadData for SpiInterface<SPI>
 where
     SPI: spi::SpiDevice<u8, Error = CommE>,
 {

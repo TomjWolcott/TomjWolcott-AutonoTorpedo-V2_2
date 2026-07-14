@@ -1,3 +1,4 @@
+use defmt::Format;
 use maybe_async_cfg::maybe;
 
 use crate::{
@@ -12,7 +13,7 @@ use crate::{
     sync(cfg(not(feature = "async")), keep_self,),
     async(cfg(feature = "async"), keep_self,)
 )]
-impl<DI, CommE> Mmc5983<DI, mode::OneShot>
+impl<DI, CommE: Format> Mmc5983<DI, mode::OneShot>
 where
     DI: ReadData<Error = Error<CommE>> + WriteData<Error = Error<CommE>>,
 {
@@ -54,7 +55,7 @@ where
     sync(cfg(not(feature = "async")), keep_self,),
     async(cfg(feature = "async"), keep_self,)
 )]
-impl<DI, CommE> Mmc5983<DI, mode::Continuous>
+impl<DI, CommE: Format> Mmc5983<DI, mode::Continuous>
 where
     DI: ReadData<Error = Error<CommE>> + WriteData<Error = Error<CommE>>,
 {

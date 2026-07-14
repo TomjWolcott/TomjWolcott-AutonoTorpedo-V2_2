@@ -1,10 +1,10 @@
 use bitflags::bitflags;
-
+use defmt::Format;
 use crate::register_address::{ProductId1, RegRead};
 
 /// All possible errors in this crate
-#[derive(Debug)]
-pub enum Error<CommE> {
+#[derive(Debug, Format)]
+pub enum Error<CommE: Format> {
     /// I²C / SPI communication error
     Comm(CommE),
     /// Invalid input data provided
@@ -13,7 +13,7 @@ pub enum Error<CommE> {
     InvalidId(ProductId),
 }
 
-impl<CommE> From<CommE> for Error<CommE> {
+impl<CommE: Format> From<CommE> for Error<CommE> {
     fn from(e: CommE) -> Self {
         Self::Comm(e)
     }
@@ -30,7 +30,7 @@ pub mod mode {
 }
 
 /// A ProductId - used to identify the device.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Format)]
 pub struct ProductId {
     raw: u8,
 }

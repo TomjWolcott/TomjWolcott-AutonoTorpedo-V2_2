@@ -14,7 +14,8 @@ repository = "https://github.com/silvergasp/ms5837-driver"
 defaults = true
 
 [dependencies]
-embedded-hal-async = "1.0.0"
+embedded-hal-async = { version = "1.0.0", features = ["defmt-03"] }
+defmt = "1.1.1"
 
 [build-dependencies]
 cc = "1.0"

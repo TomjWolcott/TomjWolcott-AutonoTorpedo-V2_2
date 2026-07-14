@@ -4,7 +4,8 @@ use embassy_stm32::adc::{Adc, AnyAdcChannel, SampleTime};
 use embassy_stm32::peripherals::{ADC1, ADC2, DMA2_CH1, DMA2_CH2};
 use embassy_stm32::Peri;
 use embassy_time::{Duration, Ticker};
-use crate::{Irqs, MotorInputs};
+use crate::Irqs;
+use crate::motor_tasks::MotorInputs;
 
 pub static ADC_RESULTS: Watch<CriticalSectionRawMutex, AdcResults, 4> = Watch::new();
 
@@ -75,17 +76,17 @@ impl AdcResults {
 }
 
 pub struct AdcController {
-    vref: AnyAdcChannel<'static, ADC1>,
-    temp: AnyAdcChannel<'static, ADC1>,
-    m0_ipropi: AnyAdcChannel<'static, ADC1>,
-    m1_ipropi: AnyAdcChannel<'static, ADC1>,
-    m2_ipropi: AnyAdcChannel<'static, ADC2>,
-    m3_ipropi: AnyAdcChannel<'static, ADC2>,
-    batt_voltage: AnyAdcChannel<'static, ADC2>,
-    adc1: Adc<'static, ADC1>,
-    adc2: Adc<'static, ADC2>,
-    dma_adc1: Peri<'static, DMA2_CH1>,
-    dma_adc2: Peri<'static, DMA2_CH2>,
+    pub vref: AnyAdcChannel<'static, ADC1>,
+    pub temp: AnyAdcChannel<'static, ADC1>,
+    pub m0_ipropi: AnyAdcChannel<'static, ADC1>,
+    pub m1_ipropi: AnyAdcChannel<'static, ADC1>,
+    pub m2_ipropi: AnyAdcChannel<'static, ADC2>,
+    pub m3_ipropi: AnyAdcChannel<'static, ADC2>,
+    pub batt_voltage: AnyAdcChannel<'static, ADC2>,
+    pub adc1: Adc<'static, ADC1>,
+    pub adc2: Adc<'static, ADC2>,
+    pub dma_adc1: Peri<'static, DMA2_CH1>,
+    pub dma_adc2: Peri<'static, DMA2_CH2>,
 }
 
 impl AdcController {

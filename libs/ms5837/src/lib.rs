@@ -1,5 +1,6 @@
 #![no_std]
 
+use defmt::Format;
 use embedded_hal_async::{delay::DelayNs, i2c::I2c};
 
 #[cfg(test)]
@@ -35,8 +36,8 @@ fn crc4(buffer: &[u16]) -> u8 {
 }
 
 /// A catch all error for this driver
-#[derive(Debug, PartialEq)]
-pub enum SensorError<E> {
+#[derive(Debug, PartialEq, Format)]
+pub enum SensorError<E: Format> {
     PromCrcMismatch { got: u8, expected: u8 },
     I2cError(E),
 }
@@ -133,7 +134,7 @@ pub struct Uninitialised<I2C: I2c, D: DelayNs> {
 impl<I2C: I2c, D: DelayNs> State for Uninitialised<I2C, D> {}
 impl<I2C: I2c, D: DelayNs> sealed::Sealed for Uninitialised<I2C, D> {}
 
-impl<I2C: I2c, D: DelayNs> Uninitialised<I2C, D> {
+impl<I2C: I2c, D: DelayNs> Uninitialised<I2C, D> where I2C::Error: Format {
     /// Reset the ms5837 internal state machine.
     async fn reset(&mut self) -> Result<(), SensorError<I2C::Error>> {
         self.i2c
@@ -269,7 +270,7 @@ pub struct TemperaturePressure {
     pub pressure: f32,
 }
 
-impl<I2C: I2c, D: DelayNs> Initialised<I2C, D> {
+impl<I2C: I2c, D: DelayNs> Initialised<I2C, D> where I2C::Error: Format {
     /// Release the i2c handle consuming the driver.
     pub fn release(self) -> (I2C, D) {
         (self.i2c, self.sleep)

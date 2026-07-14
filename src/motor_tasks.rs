@@ -1,13 +1,25 @@
+use defmt::{info, Format};
 use embassy_stm32::gpio::{Flex, Level, Speed};
 use embassy_stm32::timer::simple_pwm::{SimplePwm, SimplePwmChannels};
 use embassy_stm32::peripherals::{TIM1, TIM2, TIM3};
+use embassy_sync::watch::Watch;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use serde::{Deserialize, Serialize};
 
-#[derive(Default, Clone, Copy)]
+pub static MOTOR_INPUTS: Watch<CriticalSectionRawMutex, MotorInputs, 4> = Watch::new();
+
+#[derive(Default, Clone, Copy, Format, Serialize, Deserialize)]
+pub struct MotorInputs {
+    pub speeds: [f32; 4],
+    pub gainsels: [GainselState; 4]
+}
+
+#[derive(Default, Clone, Copy, Format, Serialize, Deserialize)]
 pub enum GainselState {
     #[default]
-    HighCurrent,
-    MedCurrent,
-    LowCurrent,
+    HighCurrent = 0,
+    MedCurrent = 1,
+    LowCurrent = 2,
 }
 
 impl GainselState {
@@ -164,5 +176,18 @@ impl MotorControllersPeri {
         self.set_gainsel(MotorIndex::M1, gainsel_state);
         self.set_gainsel(MotorIndex::M2, gainsel_state);
         self.set_gainsel(MotorIndex::M3, gainsel_state);
+    }
+}
+
+#[embassy_executor::task]
+pub async fn motor_controller_test(
+    motor_controller: MotorControllersPeri
+) {
+    let mut rx = MOTOR_INPUTS.receiver().unwrap();
+
+    loop {
+        let motor_inputs = rx.changed().await;
+
+        info!("motor_inputs: {:?}", motor_inputs);
     }
 }
