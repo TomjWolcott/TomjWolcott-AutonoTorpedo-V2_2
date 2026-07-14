@@ -2,11 +2,22 @@ use embassy_stm32::gpio::{Flex, Level, Speed};
 use embassy_stm32::timer::simple_pwm::{SimplePwm, SimplePwmChannels};
 use embassy_stm32::peripherals::{TIM1, TIM2, TIM3};
 
-#[derive(Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub enum GainselState {
+    #[default]
     HighCurrent,
     MedCurrent,
     LowCurrent,
+}
+
+impl GainselState {
+    pub fn num(&self) -> usize {
+        match self {
+            GainselState::LowCurrent => 2,
+            GainselState::MedCurrent => 1,
+            GainselState::HighCurrent => 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
