@@ -12,6 +12,7 @@ use core::cell::{OnceCell, RefCell};
 use core::fmt::Pointer;
 use core::iter::Once;
 use core::num;
+use cbor2::Simple;
 use cortex_m::interrupt::CriticalSection;
 use defmt::{unwrap, Format, Formatter};
 use defmt::export::display;
@@ -29,7 +30,7 @@ use embassy_stm32::{bind_interrupts, dma, i2c, interrupt, spi, Config, Peri, Per
 use embassy_stm32::mode::Async;
 use embassy_stm32::peripherals::*;
 use embassy_stm32::spi::Spi;
-use embassy_stm32::time::Hertz;
+use embassy_stm32::time::{Hertz, khz};
 use embassy_stm32::adc;
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::mutex::Mutex;
@@ -42,7 +43,7 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_stm32::adc::{Adc, AdcChannel, AdcConfig, AnyAdcChannel, RingBufferedAdc, Rovsm, SampleTime, Temperature, Trovs, VrefInt};
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm, SimplePwmChannels};
 use embassy_stm32::rcc::{mux, Hse, HseMode, Sysclk};
-use embassy_stm32::timer;
+use embassy_stm32::timer::{self, Ch3};
 use embassy_stm32::timer::GeneralInstance4Channel;
 use embassy_stm32::timer::simple_pwm::SimplePwmChannel;
 use embassy_sync::watch::Watch;
@@ -64,7 +65,7 @@ use static_cell::StaticCell;
 use mmc5983_rs::Mmc5983;
 use motor_tasks::MotorControllersPeri;
 use ms5837::OverSamplingRatio;
-use crate::motor_tasks::{motor_controller_test, GainselState};
+use crate::motor_tasks::{GainselState, MOTOR_INPUTS, MotorInputs, motor_controller_test};
 use core::fmt::Write;
 use glam::{Vec2, Vec3};
 use adc_tasks::{AdcController, ADC_RESULTS};
@@ -117,12 +118,12 @@ async fn main(spawner: Spawner) {
     };
 
     let p = embassy_stm32::init(stm_config);
-    // BLINKY
-    let led1 = Output::new(p.PB7, Level::High, Speed::Low);
-    let led2 = Output::new(p.PB5, Level::High, Speed::Low);
+    // // BLINKY
+    // let led1 = Output::new(p.PB7, Level::High, Speed::Low);
+    // let led2 = Output::new(p.PB5, Level::High, Speed::Low);
 
-    spawner.spawn(blink(led1, 500, 100).unwrap());
-    spawner.spawn(blink(led2, 400, 600).unwrap());
+    // spawner.spawn(blink(led1, 500, 100).unwrap());
+    // spawner.spawn(blink(led2, 400, 600).unwrap());
 
     // PWM
     let (
@@ -131,23 +132,64 @@ async fn main(spawner: Spawner) {
         pin_t3ch1, pin_t3ch2,
         pin_t3ch3, pin_t3ch4
     ) = (
-        PwmPin::new(p.PC2, OutputType::PushPull), PwmPin::new(p.PC3, OutputType::PushPull),
-        PwmPin::new(p.PA2, OutputType::PushPull), PwmPin::new(p.PA3, OutputType::PushPull),
-        PwmPin::new(p.PA6, OutputType::PushPull), PwmPin::new(p.PA7, OutputType::PushPull),
+        PwmPin::<'_, TIM1, _>::new(p.PC2, OutputType::PushPull), PwmPin::new(p.PC3, OutputType::PushPull),
+        PwmPin::<'_, TIM2, _>::new(p.PA2, OutputType::PushPull), PwmPin::<'_, TIM2, _>::new(p.PA3, OutputType::PushPull),
+        PwmPin::new(p.PA6, OutputType::PushPull), PwmPin::<'_, TIM3, _>::new(p.PA7, OutputType::PushPull),
         PwmPin::new(p.PB0, OutputType::PushPull), PwmPin::new(p.PB1, OutputType::PushPull),
     );
 
-    let motor_pwm_freq = Hertz(10_000);
+    let motor_pwm_freq = khz(30);
 
     let motor_controllers_peri = MotorControllersPeri::new(
         [Flex::new(p.PC1), Flex::new(p.PA1), Flex::new(p.PA5), Flex::new(p.PC5)],
         [0, 1, 2, 3],
-        SimplePwm::new(p.TIM1, None, None, Some(pin_t1ch3), Some(pin_t1ch4), motor_pwm_freq, Default::default()),
-        SimplePwm::new(p.TIM2, None, None, Some(pin_t2ch3), Some(pin_t2ch4), motor_pwm_freq, Default::default()),
-        SimplePwm::new(p.TIM3, Some(pin_t3ch1), Some(pin_t3ch2), Some(pin_t3ch3), Some(pin_t3ch4), motor_pwm_freq, Default::default())
+        SimplePwm::new(p.TIM1, 
+            None, None, Some(pin_t1ch3), Some(pin_t1ch4), 
+            motor_pwm_freq, Default::default()
+        ),
+        SimplePwm::new(p.TIM2, 
+            None, None, Some(pin_t2ch3), Some(pin_t2ch4), 
+            motor_pwm_freq, Default::default()
+        ),
+        SimplePwm::new(p.TIM3, 
+            Some(pin_t3ch1), Some(pin_t3ch2), Some(pin_t3ch3), Some(pin_t3ch4), 
+            motor_pwm_freq, Default::default()
+        )
     );
 
     spawner.spawn(motor_controller_test(motor_controllers_peri).unwrap());
+
+    // let mut pwm = SimplePwm::new(p.TIM3, 
+    //     Some(pin_t3ch1), Some(pin_t3ch2), Some(pin_t3ch3), Some(pin_t3ch4), 
+    //     motor_pwm_freq, Default::default()
+    // );
+    
+    // let mut gainsel = Output::new(p.PA5, Level::Low, Speed::Low);
+    // gainsel.set_low();
+    // let SimplePwmChannels { mut ch1, mut ch2, mut ch3, mut ch4 } = pwm.split();
+    // ch1.enable();
+    // ch2.enable();
+
+    // ch1.set_duty_cycle_fully_off();
+    // ch2.set_duty_cycle_fraction(4, 8);
+    let snd = MOTOR_INPUTS.sender();
+
+    loop {
+        info!("SEND!!");
+        snd.send(MotorInputs::new(0.5, 0.5, 0.5, 0.5));
+        Timer::after(Duration::from_millis(500)).await;
+        snd.send(MotorInputs::OFF);
+        Timer::after(Duration::from_millis(500)).await;
+        // ch1.set_duty_cycle_fully_off();
+        // ch2.set_duty_cycle_fraction(0, 8);
+        // info!("A");
+        // Timer::after(Duration::from_millis(1000)).await;
+        // ch1.set_duty_cycle_fully_off();
+        // ch2.set_duty_cycle_fully_off();
+        // info!("B");
+        // Timer::after(Duration::from_millis(1000)).await;
+    }
+    // ch1.max_duty_cycle();
 
     // I2C
     let mut i2c_config = i2c::Config::default();
@@ -161,43 +203,44 @@ async fn main(spawner: Spawner) {
         p.DMA1_CH1, p.DMA1_CH2, Irqs, i2c_config,
     );
 
-    let mut i2c3 = I2c::new(
-        p.I2C3, p.PC8, p.PC9,
-        p.DMA1_CH3, p.DMA1_CH4, Irqs, i2c_config,
-    );
+//     let mut i2c3 = I2c::new(
+//         p.I2C3, p.PC8, p.PC9,
+//         p.DMA1_CH3, p.DMA1_CH4, Irqs, i2c_config,
+//     );
 
-    let mut i2c4 = I2c::new(
-        p.I2C4, p.PC6, p.PC7,
-        p.DMA1_CH5, p.DMA1_CH6, Irqs, i2c_config,
-    );
+//     let mut i2c4 = I2c::new(
+//         p.I2C4, p.PC6, p.PC7,
+//         p.DMA1_CH5, p.DMA1_CH6, Irqs, i2c_config,
+//     );
 
-    // Output::new(p.PC12, Level::High, Speed::Low).set_high();
-    // Output::new(p.PD2, Level::High, Speed::Low).set_high();
+//     // Output::new(p.PC12, Level::High, Speed::Low).set_high();
+//     // Output::new(p.PD2, Level::High, Speed::Low).set_high();
+//     // Output::new(p.PB10, Level::High, Speed::Low).set_high();
 
-    // i2c_scan("i2c2", &mut i2c2).await;
-    // i2c_scan("i2c3", &mut i2c3).await;
-    // i2c_scan("i2c4", &mut i2c4).await;
+//     // i2c_scan("i2c2", &mut i2c2).await;
+//     // i2c_scan("i2c3", &mut i2c3).await;
+//     // i2c_scan("i2c4", &mut i2c4).await;
 
-    spawner.spawn(ssd1306_test(i2c3, ssd1306_en).unwrap());
-    spawner.spawn(ms5837_test(i2c2).unwrap());
+//     spawner.spawn(ssd1306_test(i2c3, ssd1306_en).unwrap());
+//     spawner.spawn(ms5837_test(i2c2).unwrap());
 
-    // SPI
-    let mut spi_config = spi::Config::default();
-    spi_config.frequency = Hertz(100_000);
-    // spi_config.
+//     // SPI
+//     let mut spi_config = spi::Config::default();
+//     spi_config.frequency = Hertz(100_000);
+//     // spi_config.
 
-    let bus = IMU_MAG_SPI.init(Mutex::new(Spi::new(
-        p.SPI2, p.PB13, p.PB15, p.PB14,
-        p.DMA1_CH7, p.DMA1_CH8, Irqs, spi_config
-    )));
+//     let bus = IMU_MAG_SPI.init(Mutex::new(Spi::new(
+//         p.SPI2, p.PB13, p.PB15, p.PB14,
+//         p.DMA1_CH7, p.DMA1_CH8, Irqs, spi_config
+//     )));
 
-    let mut icm42688p_cs = Output::new(p.PA11, Level::High, Speed::High);
-    let mut mmc5983ma_cs = Output::new(p.PA12, Level::High, Speed::Low);
+//     let mut icm42688p_cs = Output::new(p.PA11, Level::High, Speed::High);
+//     let mut mmc5983ma_cs = Output::new(p.PA12, Level::High, Speed::Low);
 
-    let icm42688p_spidev = SpiDevice::new(bus, icm42688p_cs);
-    let mmc5983_spidev = SpiDevice::new(bus, mmc5983ma_cs);
+//     let icm42688p_spidev = SpiDevice::new(bus, icm42688p_cs);
+//     let mmc5983_spidev = SpiDevice::new(bus, mmc5983ma_cs);
 
-    spawner.spawn(icm42688p_mmc5983_sender(icm42688p_spidev, mmc5983_spidev).unwrap());
+//     spawner.spawn(icm42688p_mmc5983_sender(icm42688p_spidev, mmc5983_spidev).unwrap());
 
     // adc
     let mut adc1_config = AdcConfig::default();
@@ -228,35 +271,46 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(adc_test(adc_controller).unwrap());
 
-    // uart
-    let mut uart4_config = UartConfig::default();
-    uart4_config.baudrate = 115200;
+//     // uart
+//     let mut uart4_config = UartConfig::default();
+//     uart4_config.baudrate = 115200;
 
-    let (uart4_tx, uart4_rx) = Uart::new(
-        p.UART4,
-        p.PC11,
-        p.PC10,
-        p.DMA2_CH3,
-        p.DMA2_CH4,
-        Irqs,
-        uart4_config
-    ).unwrap().split();
+//     let (uart4_tx, uart4_rx) = Uart::new(
+//         p.UART4,
+//         p.PC11,
+//         p.PC10,
+//         p.DMA2_CH3,
+//         p.DMA2_CH4,
+//         Irqs,
+//         uart4_config
+//     ).unwrap().split();
 
-    spawner.spawn(uart_comms_rx(uart4_rx).unwrap());
-    spawner.spawn(uart_comms_tx(uart4_tx).unwrap());
+//     spawner.spawn(uart_comms_rx(uart4_rx).unwrap());
+//     spawner.spawn(uart_comms_tx(uart4_tx).unwrap());
 
-    // let mut uart1_config = UartConfig::default();
-    // uart1_config.baudrate = 115200;
+//     // let mut uart1_config = UartConfig::default();
+//     // uart1_config.baudrate = 115200;
 
-    // let (uart1_tx, uart1_rx) = Uart::new(
-    //     p.USART1,
-    //     p.PA10,
-    //     p.PB6,
-    //     p.DMA2_CH5,
-    //     p.DMA2_CH6,
-    //     Irqs,
-    //     uart1_config
-    // ).unwrap().split();
+//     // let (uart1_tx, uart1_rx) = Uart::new(
+//     //     p.USART1,
+//     //     p.PA10,
+//     //     p.PB6,
+//     //     p.DMA2_CH5,
+//     //     p.DMA2_CH6,
+//     //     Irqs,
+//     //     uart1_config
+//     // ).unwrap().split();
+
+//     // more motors
+// //     let snd = MOTOR_INPUTS.sender();
+// //     let mut x = 0.7;
+    
+// //     loop {
+// //         snd.send(MotorInputs::new(x, x, x, x));
+// //         Timer::after(Duration::from_millis(1000)).await;
+// //         snd.send(MotorInputs::OFF);
+// //         Timer::after(Duration::from_millis(10000)).await;
+// //     }
 }
 
 #[embassy_executor::task]
@@ -305,7 +359,7 @@ macro_rules! comms_println {
             let _ = msg.push(5u8);
             let _ = msg.extend_from_slice(payload.as_bytes());
 
-            match $crate::uart_tx_sender().try_send(msg) {
+            match $crate::UART_TX_CHANNEL.sender().try_send(msg) {
                 Ok(_) => {}
                 Err(_) => defmt::warn!("uart_println!: tx queue full, dropped"),
             }
@@ -436,6 +490,7 @@ async fn ssd1306_test(
         }
 
         if let Some(imu) = imu_reader.try_get() {
+            // info!("IMU!!");
             let center = Point::new(110, 45);
             let radius = 15;
             let tl = center - Point::new(radius, radius);
@@ -461,9 +516,9 @@ async fn ssd1306_test(
                 .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
                 .draw(&mut display).unwrap();
 
-            Line::new(center, center + v_mag)
-                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 2))
-                .draw(&mut display).unwrap();
+            // Line::new(center, center + v_mag)
+            //     .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 2))
+            //     .draw(&mut display).unwrap();
         }
 
         let res = display.flush().await;

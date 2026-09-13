@@ -160,22 +160,23 @@ pub async fn icm42688p_mmc5983_sender(
                     field.z_gauss() - offset.z,
                 );
 
-                let (x, y, z) = field.gauss();
-                info!("Magnetic field: X={} Y={} Z={} Gauss", x, y, z);
+                imu_mag_res.mag_strength = imu_mag_res.mag.length();
+
+                // info!("Magnetic field: ({},{},{}) Gauss, mag: {}", imu_mag_res.mag.x, imu_mag_res.mag.y, imu_mag_res.mag.z, imu_mag_res.mag.length());
             }
             Err(e) => {
                 info!("MMC error reading magnetic field: {:?}", e);
             }
         };
 
-        match mmc.temperature().await {
-            Ok(mag_temp) => {
-                imu_mag_res.mag_temp = mag_temp.degrees_celsius();
-            }
-            Err(e) => {
-                info!("MMC error reading temperature: {:?}", e);
-            }
-        };
+        // match mmc.temperature().await {
+        //     Ok(mag_temp) => {
+        //         imu_mag_res.mag_temp = mag_temp.degrees_celsius();
+        //     }
+        //     Err(e) => {
+        //         info!("MMC error reading temperature: {:?}", e);
+        //     }
+        // };
 
         // ICM
         if let Ok(num_words) = icm.read_fifo(&mut raw_words).await {
@@ -218,6 +219,7 @@ pub async fn icm42688p_mmc5983_sender(
     //		pos += vel * dt_s;
         }
 
+        // info!("SENDING IMU");
         sender.send(imu_mag_res.clone());
 	    now = embassy_time::Instant::now();
     }

@@ -1,10 +1,14 @@
+use cortex_m::prelude::_embedded_hal_Pwm;
 use defmt::{info, Format};
 use embassy_stm32::gpio::{Flex, Level, Speed};
+use embassy_stm32::timer::Channel;
 use embassy_stm32::timer::simple_pwm::{SimplePwm, SimplePwmChannels};
 use embassy_stm32::peripherals::{TIM1, TIM2, TIM3};
 use embassy_sync::watch::Watch;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use serde::{Deserialize, Serialize};
+
+use crate::adc_tasks::ADC_RESULTS;
 
 pub static MOTOR_INPUTS: Watch<CriticalSectionRawMutex, MotorInputs, 4> = Watch::new();
 
@@ -12,6 +16,20 @@ pub static MOTOR_INPUTS: Watch<CriticalSectionRawMutex, MotorInputs, 4> = Watch:
 pub struct MotorInputs {
     pub speeds: [f32; 4],
     pub gainsels: [GainselState; 4]
+}
+
+impl MotorInputs {
+    pub const OFF: Self = MotorInputs { speeds: [0.0; 4], gainsels: [GainselState::HighCurrent; 4] };
+
+    pub fn new(m_tl: f32, m_tr: f32, m_bl: f32, m_br: f32) -> Self {
+        let mut speeds = [0.0; 4];
+
+        speeds[MotorId::TL.num()] = m_tl;
+        speeds[MotorId::TR.num()] = m_tr;
+        speeds[MotorId::BL.num()] = m_bl;
+        speeds[MotorId::BR.num()] = m_br;
+        MotorInputs { speeds, gainsels: [GainselState::HighCurrent; 4] }
+    }
 }
 
 #[derive(Default, Clone, Copy, Format, Serialize, Deserialize)]
@@ -32,9 +50,20 @@ impl GainselState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Format)]
 pub enum MotorId {
     TL = 0, TR = 1, BL = 2, BR = 3
+}
+
+impl MotorId {
+    pub fn num(self) -> usize {
+        match self {
+            MotorId::TL => 0,
+            MotorId::TR => 1,
+            MotorId::BL => 2,
+            MotorId::BR => 3
+        }
+    }
 }
 
 const MOTOR_MAP: [MotorIndex; 4] = [
@@ -50,7 +79,7 @@ impl Into<MotorIndex> for MotorId {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Format)]
 pub enum MotorIndex {
     M0 = 0, M1 = 1, M2 = 2, M3 = 3
 }
@@ -79,10 +108,21 @@ impl MotorControllersPeri {
     pub fn new(
         gainsels: [Flex<'static>; 4],
         ipropi_indexes: [u32; 4],
-        t1: SimplePwm<'static, TIM1>,
-        t2: SimplePwm<'static, TIM2>,
-        t3: SimplePwm<'static, TIM3>,
+        mut t1: SimplePwm<'static, TIM1>,
+        mut t2: SimplePwm<'static, TIM2>,
+        mut t3: SimplePwm<'static, TIM3>,
     ) -> Self {
+        t1.enable(Channel::Ch3);
+        t1.enable(Channel::Ch4);
+
+        t2.enable(Channel::Ch3);
+        t2.enable(Channel::Ch4);
+
+        t3.enable(Channel::Ch1);
+        t3.enable(Channel::Ch2);
+        t3.enable(Channel::Ch3);
+        t3.enable(Channel::Ch4);
+
         let mut peri = Self {
             gainsels,
             gainsel_states: [GainselState::HighCurrent; 4],
@@ -110,8 +150,9 @@ impl MotorControllersPeri {
     }
 
     pub fn set_motor_speed(&mut self, motor_index: MotorIndex, speed: f32) {
-        let speed_u8 = (100.0 * speed.abs()) as u8;
+        let speed_u8 = ((100.0 * speed.abs()) as u8) % 101;
 
+        info!("Setting motor {:?} speed to {} ({}%)", motor_index, speed, speed_u8);
         match motor_index {
             MotorIndex::M0 => {
                 if speed > 0.0 {
@@ -155,7 +196,7 @@ impl MotorControllersPeri {
     pub fn set_gainsel(&mut self, motor_index: MotorIndex, gainsel_state: GainselState) {
         match gainsel_state {
             GainselState::LowCurrent => {
-                self.gainsels[motor_index.num()].set_level(Level::Low);
+                self.gainsels[motor_index.num()].set_level(Level::High);
                 self.gainsels[motor_index.num()].set_as_output(Speed::Low);
             },
             GainselState::MedCurrent => {
@@ -163,7 +204,7 @@ impl MotorControllersPeri {
                 self.gainsels[motor_index.num()].set_as_analog();
             },
             GainselState::HighCurrent => {
-                self.gainsels[motor_index.num()].set_level(Level::High);
+                self.gainsels[motor_index.num()].set_level(Level::Low);
                 self.gainsels[motor_index.num()].set_as_output(Speed::Low);
             }
         }
@@ -177,17 +218,31 @@ impl MotorControllersPeri {
         self.set_gainsel(MotorIndex::M2, gainsel_state);
         self.set_gainsel(MotorIndex::M3, gainsel_state);
     }
+
+    pub fn set_from_inputs(&mut self, inputs: &MotorInputs) {
+        for i in 0..4 {
+            self.set_motor_speed(MOTOR_MAP[i], inputs.speeds[i]);
+            self.set_gainsel(MOTOR_MAP[i], inputs.gainsels[i]);
+        }
+    }
 }
 
 #[embassy_executor::task]
 pub async fn motor_controller_test(
-    motor_controller: MotorControllersPeri
+    mut motor_controller: MotorControllersPeri
 ) {
+    let mut adc_reader = ADC_RESULTS.receiver().unwrap();
     let mut rx = MOTOR_INPUTS.receiver().unwrap();
 
     loop {
         let motor_inputs = rx.changed().await;
 
-        info!("motor_inputs: {:?}", motor_inputs);
+        motor_controller.set_from_inputs(&motor_inputs);
+
+        // if let Some(adc_results) = adc_reader.try_get() {
+        //     info!("adc_results: {:?}", adc_results);
+        // }
+
+        // info!("motor_inputs: {:?}", motor_inputs);
     }
 }

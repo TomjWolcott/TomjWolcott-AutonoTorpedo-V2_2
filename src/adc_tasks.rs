@@ -4,12 +4,13 @@ use embassy_stm32::adc::{Adc, AnyAdcChannel, SampleTime};
 use embassy_stm32::peripherals::{ADC1, ADC2, DMA2_CH1, DMA2_CH2};
 use embassy_stm32::Peri;
 use embassy_time::{Duration, Ticker};
-use crate::Irqs;
+// use crate::Irqs;
 use crate::motor_tasks::MotorInputs;
+use defmt::{info, Format};
 
 pub static ADC_RESULTS: Watch<CriticalSectionRawMutex, AdcResults, 4> = Watch::new();
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Format)]
 pub struct AdcResults {
     pub temp_c: f32,
     pub ipropis_v: [f32; 4],
@@ -94,18 +95,18 @@ impl AdcController {
         let mut buf = [0u16; 7];
         let (buf1, buf2) = buf.split_at_mut(4);
 
-        self.adc1.read(self.dma_adc1.reborrow(), Irqs, [
-            (&mut self.vref, SampleTime::CYCLES640_5),
-            (&mut self.temp, SampleTime::CYCLES640_5),
-            (&mut self.m0_ipropi, SampleTime::CYCLES640_5),
-            (&mut self.m1_ipropi, SampleTime::CYCLES640_5)
-        ].into_iter(), buf1.try_into().unwrap()).await;
+        // self.adc1.read(self.dma_adc1.reborrow(), Irqs, [
+        //     (&mut self.vref, SampleTime::CYCLES640_5),
+        //     (&mut self.temp, SampleTime::CYCLES640_5),
+        //     (&mut self.m0_ipropi, SampleTime::CYCLES640_5),
+        //     (&mut self.m1_ipropi, SampleTime::CYCLES640_5)
+        // ].into_iter(), buf1.try_into().unwrap()).await;
 
-        self.adc2.read(self.dma_adc2.reborrow(), Irqs, [
-            (&mut self.m2_ipropi, SampleTime::CYCLES640_5),
-            (&mut self.m3_ipropi, SampleTime::CYCLES640_5),
-            (&mut self.batt_voltage, SampleTime::CYCLES640_5),
-        ].into_iter(), buf2.try_into().unwrap()).await;
+        // self.adc2.read(self.dma_adc2.reborrow(), Irqs, [
+        //     (&mut self.m2_ipropi, SampleTime::CYCLES640_5),
+        //     (&mut self.m3_ipropi, SampleTime::CYCLES640_5),
+        //     (&mut self.batt_voltage, SampleTime::CYCLES640_5),
+        // ].into_iter(), buf2.try_into().unwrap()).await;
 
         buf
     }
