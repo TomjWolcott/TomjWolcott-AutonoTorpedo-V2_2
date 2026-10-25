@@ -7,17 +7,21 @@ mod sensor_tasks;
 mod adc_tasks;
 mod comms;
 mod himax_sdk;
+mod localization;
+mod states;
 
 use core::cell::{OnceCell, RefCell};
 use core::fmt::Pointer;
 use core::iter::Once;
 use core::num;
-use cbor2::Simple;
+use cbor2::{Simple, de};
 use cortex_m::interrupt::CriticalSection;
 use defmt::{unwrap, Format, Formatter};
 use defmt::export::display;
 use embassy_embedded_hal::SetConfig;
 use embassy_sync::channel::{Channel, Sender};
+use embassy_sync::pubsub::WaitResult;
+use embassy_sync::signal::Signal;
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 #[cfg(feature = "defmt")]
@@ -65,6 +69,10 @@ use static_cell::StaticCell;
 use mmc5983_rs::Mmc5983;
 use motor_tasks::MotorControllersPeri;
 use ms5837::OverSamplingRatio;
+use crate::comms::{ActionMessage, DataChunk, Message, MessageType, OtherData};
+use crate::comms::rx::{WEBSITE_RX_PUB_SUB, uart_comms_rx};
+use crate::comms::tx::uart_comms_tx;
+use crate::localization::LocalizationOutput;
 use crate::motor_tasks::{GainselState, MOTOR_INPUTS, MotorInputs, motor_controller_test};
 use core::fmt::Write;
 use glam::{Vec2, Vec3};
@@ -74,6 +82,8 @@ use crate::adc_tasks::adc_test;
 use crate::sensor_tasks::{icm42688p_mmc5983_sender, ms5837_test};
 use embassy_stm32::usart::{Config as UartConfig, Uart, UartRx, UartTx};
 use embassy_stm32::usart;
+
+use statig::prelude::*;
 
 bind_interrupts!(struct Irqs {
         I2C2_EV => i2c::EventInterruptHandler<embassy_stm32::peripherals::I2C2>;
@@ -108,6 +118,9 @@ bind_interrupts!(struct Irqs {
 
 static IMU_MAG_SPI: StaticCell<Mutex<NoopRawMutex, Spi<'static, Async, spi::mode::Master>>> = StaticCell::new();
 
+static STATE_EVENT_SIGNAL: Signal<CriticalSectionRawMutex, ATEvent> = Signal::new();
+static STATE_MACHINE: Watch<CriticalSectionRawMutex, ATStateMachine, 10> = Watch::new();
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut stm_config = Config::default();
@@ -118,12 +131,12 @@ async fn main(spawner: Spawner) {
     };
 
     let p = embassy_stm32::init(stm_config);
-    // // BLINKY
-    // let led1 = Output::new(p.PB7, Level::High, Speed::Low);
-    // let led2 = Output::new(p.PB5, Level::High, Speed::Low);
+    // BLINKY
+    let led1 = Output::new(p.PB7, Level::High, Speed::Low);
+    let led2 = Output::new(p.PB5, Level::High, Speed::Low);
 
-    // spawner.spawn(blink(led1, 500, 100).unwrap());
-    // spawner.spawn(blink(led2, 400, 600).unwrap());
+    spawner.spawn(blink(led1, 0).unwrap());
+    spawner.spawn(blink(led2, 1).unwrap());
 
     // PWM
     let (
@@ -158,38 +171,7 @@ async fn main(spawner: Spawner) {
     );
 
     spawner.spawn(motor_controller_test(motor_controllers_peri).unwrap());
-
-    // let mut pwm = SimplePwm::new(p.TIM3, 
-    //     Some(pin_t3ch1), Some(pin_t3ch2), Some(pin_t3ch3), Some(pin_t3ch4), 
-    //     motor_pwm_freq, Default::default()
-    // );
-    
-    // let mut gainsel = Output::new(p.PA5, Level::Low, Speed::Low);
-    // gainsel.set_low();
-    // let SimplePwmChannels { mut ch1, mut ch2, mut ch3, mut ch4 } = pwm.split();
-    // ch1.enable();
-    // ch2.enable();
-
-    // ch1.set_duty_cycle_fully_off();
-    // ch2.set_duty_cycle_fraction(4, 8);
     let snd = MOTOR_INPUTS.sender();
-
-    loop {
-        info!("SEND!!");
-        snd.send(MotorInputs::new(0.5, 0.5, 0.5, 0.5));
-        Timer::after(Duration::from_millis(500)).await;
-        snd.send(MotorInputs::OFF);
-        Timer::after(Duration::from_millis(500)).await;
-        // ch1.set_duty_cycle_fully_off();
-        // ch2.set_duty_cycle_fraction(0, 8);
-        // info!("A");
-        // Timer::after(Duration::from_millis(1000)).await;
-        // ch1.set_duty_cycle_fully_off();
-        // ch2.set_duty_cycle_fully_off();
-        // info!("B");
-        // Timer::after(Duration::from_millis(1000)).await;
-    }
-    // ch1.max_duty_cycle();
 
     // I2C
     let mut i2c_config = i2c::Config::default();
@@ -203,44 +185,44 @@ async fn main(spawner: Spawner) {
         p.DMA1_CH1, p.DMA1_CH2, Irqs, i2c_config,
     );
 
-//     let mut i2c3 = I2c::new(
-//         p.I2C3, p.PC8, p.PC9,
-//         p.DMA1_CH3, p.DMA1_CH4, Irqs, i2c_config,
-//     );
+    let mut i2c3 = I2c::new(
+        p.I2C3, p.PC8, p.PC9,
+        p.DMA1_CH3, p.DMA1_CH4, Irqs, i2c_config,
+    );
 
-//     let mut i2c4 = I2c::new(
-//         p.I2C4, p.PC6, p.PC7,
-//         p.DMA1_CH5, p.DMA1_CH6, Irqs, i2c_config,
-//     );
+    let mut i2c4 = I2c::new(
+        p.I2C4, p.PC6, p.PC7,
+        p.DMA1_CH5, p.DMA1_CH6, Irqs, i2c_config,
+    );
 
-//     // Output::new(p.PC12, Level::High, Speed::Low).set_high();
-//     // Output::new(p.PD2, Level::High, Speed::Low).set_high();
-//     // Output::new(p.PB10, Level::High, Speed::Low).set_high();
+    // Output::new(p.PC12, Level::High, Speed::Low).set_high();
+    // Output::new(p.PD2, Level::High, Speed::Low).set_high();
+    // Output::new(p.PB10, Level::High, Speed::Low).set_high();
 
-//     // i2c_scan("i2c2", &mut i2c2).await;
-//     // i2c_scan("i2c3", &mut i2c3).await;
-//     // i2c_scan("i2c4", &mut i2c4).await;
+    // i2c_scan("i2c2", &mut i2c2).await;
+    // i2c_scan("i2c3", &mut i2c3).await;
+    // i2c_scan("i2c4", &mut i2c4).await;
 
-//     spawner.spawn(ssd1306_test(i2c3, ssd1306_en).unwrap());
-//     spawner.spawn(ms5837_test(i2c2).unwrap());
+    spawner.spawn(ssd1306_test(i2c3, ssd1306_en).unwrap());
+    spawner.spawn(ms5837_test(i2c2).unwrap());
 
-//     // SPI
-//     let mut spi_config = spi::Config::default();
-//     spi_config.frequency = Hertz(100_000);
-//     // spi_config.
+    // SPI
+    let mut spi_config = spi::Config::default();
+    spi_config.frequency = Hertz(100_000);
+    // spi_config.
 
-//     let bus = IMU_MAG_SPI.init(Mutex::new(Spi::new(
-//         p.SPI2, p.PB13, p.PB15, p.PB14,
-//         p.DMA1_CH7, p.DMA1_CH8, Irqs, spi_config
-//     )));
+    let bus = IMU_MAG_SPI.init(Mutex::new(Spi::new(
+        p.SPI2, p.PB13, p.PB15, p.PB14,
+        p.DMA1_CH7, p.DMA1_CH8, Irqs, spi_config
+    )));
 
-//     let mut icm42688p_cs = Output::new(p.PA11, Level::High, Speed::High);
-//     let mut mmc5983ma_cs = Output::new(p.PA12, Level::High, Speed::Low);
+    let icm42688p_cs = Output::new(p.PA11, Level::High, Speed::High);
+    let mmc5983ma_cs = Output::new(p.PA12, Level::High, Speed::Low);
 
-//     let icm42688p_spidev = SpiDevice::new(bus, icm42688p_cs);
-//     let mmc5983_spidev = SpiDevice::new(bus, mmc5983ma_cs);
+    let icm42688p_spidev = SpiDevice::new(bus, icm42688p_cs);
+    let mmc5983_spidev = SpiDevice::new(bus, mmc5983ma_cs);
 
-//     spawner.spawn(icm42688p_mmc5983_sender(icm42688p_spidev, mmc5983_spidev).unwrap());
+    spawner.spawn(icm42688p_mmc5983_sender(icm42688p_spidev, mmc5983_spidev).unwrap());
 
     // adc
     let mut adc1_config = AdcConfig::default();
@@ -271,125 +253,73 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(adc_test(adc_controller).unwrap());
 
-//     // uart
-//     let mut uart4_config = UartConfig::default();
-//     uart4_config.baudrate = 115200;
+    // uart
+    let mut uart4_config = UartConfig::default();
+    uart4_config.baudrate = 115200;
 
-//     let (uart4_tx, uart4_rx) = Uart::new(
-//         p.UART4,
-//         p.PC11,
-//         p.PC10,
-//         p.DMA2_CH3,
-//         p.DMA2_CH4,
-//         Irqs,
-//         uart4_config
-//     ).unwrap().split();
+    let (uart4_tx, uart4_rx) = Uart::new(
+        p.UART4,
+        p.PC11,
+        p.PC10,
+        p.DMA2_CH3,
+        p.DMA2_CH4,
+        Irqs,
+        uart4_config
+    ).unwrap().split();
 
-//     spawner.spawn(uart_comms_rx(uart4_rx).unwrap());
-//     spawner.spawn(uart_comms_tx(uart4_tx).unwrap());
+    spawner.spawn(uart_comms_rx(uart4_rx).unwrap());
+    spawner.spawn(uart_comms_tx(uart4_tx).unwrap());
 
-//     // let mut uart1_config = UartConfig::default();
-//     // uart1_config.baudrate = 115200;
+    let mut uart1_config = UartConfig::default();
+    uart1_config.baudrate = 115200;
 
-//     // let (uart1_tx, uart1_rx) = Uart::new(
-//     //     p.USART1,
-//     //     p.PA10,
-//     //     p.PB6,
-//     //     p.DMA2_CH5,
-//     //     p.DMA2_CH6,
-//     //     Irqs,
-//     //     uart1_config
-//     // ).unwrap().split();
+    let (uart1_tx, uart1_rx) = Uart::new(
+        p.USART1,
+        p.PA10,
+        p.PB6,
+        p.DMA2_CH5,
+        p.DMA2_CH6,
+        Irqs,
+        uart1_config
+    ).unwrap().split();
 
-//     // more motors
-// //     let snd = MOTOR_INPUTS.sender();
-// //     let mut x = 0.7;
-    
-// //     loop {
-// //         snd.send(MotorInputs::new(x, x, x, x));
-// //         Timer::after(Duration::from_millis(1000)).await;
-// //         snd.send(MotorInputs::OFF);
-// //         Timer::after(Duration::from_millis(10000)).await;
-// //     }
-}
+    spawner.spawn(send_data().unwrap());
+    spawner.spawn(msg_listener().unwrap());
 
-#[embassy_executor::task]
-async fn uart_comms_rx(mut rx: UartRx<'static, Async>) {
-    let mut buffer = [0u8; 1000];
+    let mut sm = ATStateMachine::default();
+    let sm_sender = STATE_MACHINE.sender();
 
+    sm_sender.send(sm);
+
+    // Responsible for managing tasks according to state machine
     loop {
-        let num_bytes = match rx.read_until_idle(&mut buffer).await {
-            Ok(num_bytes) => num_bytes,
-            Err(e) => {
-                info!("Uart4_rx error: {:?}", e);
-                continue;
+        let event = STATE_EVENT_SIGNAL.wait().await;
+
+        comms_println!("STATE MACHINE: Got event: {:?}", event);
+
+        match event {
+            ATEvent::Connected(ty) => {
+                sm.connected_state = ConnectedState::Connected(ty);
+            },
+            ATEvent::Disconnected => {
+                sm.connected_state = ConnectedState::Unconnected;
+            },
+            ATEvent::UnsafeCondition(_condition) => {
+                sm.operation_mode = OperationMode::SafeMode;
             }
-        };
-
-        info!("Received: {:?}", &buffer[..num_bytes]);
-    }
-
-}
-
-const UART_TX_MSG_SIZE: usize = 500; // max bytes per message, tune as needed
-const UART_TX_QUEUE_DEPTH: usize = 10; // max queued messages
-
-pub const UART_HEADER: [u8; 4] = [0x11, 0x0F, 0xFF, 0x00];
-const UART_HEADER_LEN: usize = 6; // 4 magic bytes + len byte + id byte
-
-pub type UartTxMsg = Vec<u8, UART_TX_MSG_SIZE>;
-
-#[macro_export]
-macro_rules! comms_println {
-    ($($arg:tt)*) => {{
-        let mut payload: heapless::String<{ $crate::UART_TX_MSG_SIZE - $crate::UART_HEADER_LEN }> =
-            heapless::String::new();
-
-        if core::fmt::Write::write_fmt(&mut payload, format_args!($($arg)*)).is_err() {
-            defmt::warn!("uart_println!: message truncated, formatting overflowed buffer");
+            _ => {}
         }
 
-        let total_len = $crate::UART_HEADER_LEN + payload.len();
-        if total_len > 255 || total_len > $crate::UART_TX_MSG_SIZE {
-            defmt::warn!("uart_println!: message too long ({} bytes), dropped", total_len);
-        } else {
-            let mut msg: $crate::UartTxMsg = heapless::Vec::new();
-            let _ = msg.extend_from_slice(&$crate::UART_HEADER);
-            let _ = msg.push(total_len as u8);
-            let _ = msg.push(5u8);
-            let _ = msg.extend_from_slice(payload.as_bytes());
-
-            match $crate::UART_TX_CHANNEL.sender().try_send(msg) {
-                Ok(_) => {}
-                Err(_) => defmt::warn!("uart_println!: tx queue full, dropped"),
-            }
-        }
-    }};
-}
-
-static UART_TX_CHANNEL: Channel<CriticalSectionRawMutex, UartTxMsg, UART_TX_QUEUE_DEPTH> =
-    Channel::new();
-
-/// Call from any task to get a handle for queuing outgoing UART bytes.
-pub fn uart_comms_tx_sender() -> Sender<'static, CriticalSectionRawMutex, UartTxMsg, UART_TX_QUEUE_DEPTH> {
-    UART_TX_CHANNEL.sender()
-}
-
-#[embassy_executor::task]
-async fn uart_comms_tx(mut tx: UartTx<'static, Async>) {
-    let receiver = UART_TX_CHANNEL.receiver();
-
-    loop {
-        let msg = receiver.receive().await;
-        if let Err(e) = tx.write(&msg).await {
-            info!("Uart4_tx error: {:?}", e);
-        }
+        sm_sender.send(sm);
     }
 }
 
 #[embassy_executor::task(pool_size = 2)]
-async fn blink(mut led: Output<'static>, wait1: u64, wait2: u64) {
+async fn blink(mut led: Output<'static>, index: usize) {
+    let mut rx = STATE_MACHINE.receiver().unwrap();
+
     loop {
+        let (wait1, wait2) = rx.get().await.blink_pattern(index);
         led.set_high();
         Timer::after(Duration::from_millis(wait1)).await;
         led.set_low();
@@ -462,14 +392,35 @@ async fn ssd1306_test(
         }
 
         if let Some(adc_results) = adc_reader.try_get() {
+
+            info!("Read: {} vs, Estimated: {}", adc_results.batt_v, adc_results.estimated_batt_v);
             buf.clear();
-            write!(buf, "Bat:{:.3}, Tmp:{:.2}", adc_results.batt_v, adc_results.temp_c).unwrap();
+            write!(buf, "Bat:{:.3}, Tmp:{:.2}", adc_results.estimated_batt_v, adc_results.temp_c).unwrap();
             Rectangle::new(Point::new(0, 10), Size::new(buf.len() as u32 * 6, 10))
                 .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
                 .draw(&mut display).unwrap();
             Text::with_baseline(buf.as_str(), Point::new(0, 10), text_style, Baseline::Top)
                 .draw(&mut display)
                 .unwrap();
+
+            let h = 20;
+            let w = 6;
+
+            for i in 0..4 {
+                let x = adc_results.motor_stats().motor_a[i as usize] / 2.0;
+
+                Rectangle::new(Point::new(5+i*(w as i32 +3), 40), Size::new(w, h))
+                    .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 2))
+                    .draw(&mut display).unwrap();
+                Rectangle::new(Point::new(5+i*(w as i32 +3), 40), Size::new(w, h))
+                    .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+                    .draw(&mut display).unwrap();
+
+                let h2 = (h as f32 * x).clamp(0.0, h as f32) as u32;
+                Rectangle::new(Point::new(5+i*(w as i32 +3), 40 + h as i32 - h2 as i32), Size::new(w, (h as f32 * x).clamp(0.0, h as f32) as u32))
+                    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                    .draw(&mut display).unwrap();
+            }
         }
 
         if let Some(pressure) = pressure_reader.try_get() {
@@ -529,3 +480,193 @@ async fn ssd1306_test(
     }
 }
 
+// Some kind of event that will casues tasks to be spawned or killed, or other state changes
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ATEvent {
+    Connected(ConnectionType),
+    Disconnected,
+    UnsafeCondition(UnsafeCondition)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnsafeCondition {
+    BatteryLow(f32),
+    OverCurrent(f32),
+    BadTemperature(f32)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationMode {
+    Normal(CalibrationState),
+    SafeMode // Low battery, overcurrent, bad temp, or other bad condition
+}
+
+impl Default for OperationMode {
+    fn default() -> Self {
+        OperationMode::Normal(CalibrationState::NotCalibrating)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectedState {
+    Connected(ConnectionType),
+    Unconnected
+}
+
+impl Default for ConnectedState {
+    fn default() -> Self {
+        ConnectedState::Unconnected
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionType {
+    UART,
+    BLE
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum CalibrationState {
+    #[default]
+    NotCalibrating,
+    Calibrating
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct ATStateMachine {
+    connected_state: ConnectedState,
+    operation_mode: OperationMode
+}
+
+impl ATStateMachine {
+    fn blink_pattern(&self, index: usize) -> (u64, u64) {
+        (match self.connected_state {
+            ConnectedState::Connected(_) => {
+                match self.operation_mode {
+                    OperationMode::Normal(_) => [(500, 200), (200, 500)],
+                    OperationMode::SafeMode => [(10, 5000), (10, 5000)]
+                }
+            },
+            ConnectedState::Unconnected => [(1000, 100), (1000, 100)]
+        })[index % 2]
+    }
+}
+
+#[embassy_executor::task]
+async fn msg_listener() {
+    let mut sub = WEBSITE_RX_PUB_SUB.subscriber().unwrap();
+    let mut sm_rx: embassy_sync::watch::Receiver<'_, CriticalSectionRawMutex, ATStateMachine, 10> = STATE_MACHINE.receiver().unwrap();
+    let mut sm;
+
+    loop {
+        let WaitResult::Message(msg) = sub.next_message().await else { continue; };
+        sm = sm_rx.get().await;
+        let motors_tx = MOTOR_INPUTS.sender();
+
+        // comms_println!("msg_listener: received message of type {:?}", msg.ty());
+
+        if sm.connected_state == ConnectedState::Unconnected && msg.ty() == MessageType::Ping {
+            STATE_EVENT_SIGNAL.signal(ATEvent::Connected(ConnectionType::UART));
+        }
+
+        if msg.ty() == MessageType::Action { match ActionMessage::try_from(msg) {
+            Ok(action) => match action {
+                ActionMessage::Noop => {
+                    // Handle Noop action
+                }
+                ActionMessage::CalibrationSettings(settings) => {
+                    // Handle CalibrationSettings action
+                }
+                ActionMessage::SetMotorSpeeds(inputs) => {
+                    motors_tx.send(inputs);
+                    // comms_println!("REQUESTED MOTOR INPUT: {:?}", inputs);
+                }
+                ActionMessage::RequestSendConfig => {
+                    // Handle RequestSendConfig action
+                }
+                ActionMessage::CalibrationMessage(msg) => {
+                    // Handle CalibrationMessage action
+                }
+            } Err(_) => {comms_println!("msg_listener: failed to parse action message");}  }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn send_data() {
+    let mut sm_rx = STATE_MACHINE.receiver().unwrap();
+    let mut sm;
+    let motor_tx = MOTOR_INPUTS.sender();
+        
+    let mut adc_reader = ADC_RESULTS.receiver().unwrap();
+    let mut pressure_reader = PRESSURE_RESULTS.receiver().unwrap();
+    let mut imu_reader = IMU_MAG_RESULTS.receiver().unwrap();
+    let mut ticker = Ticker::every(Duration::from_hz(20));
+
+    loop {
+        ticker.next().await;
+        sm = sm_rx.get().await;
+
+        if let OperationMode::SafeMode = sm.operation_mode {
+            // Don't send data if in safe mode
+            continue;
+        }
+
+        if let ConnectedState::Unconnected = sm.connected_state {
+            // Don't send data if not connected
+            continue;
+        }
+
+        let imu_mag_output = imu_reader.try_get();
+
+        let data_chunk = DataChunk {
+            adc_data: adc_reader.try_get(),
+            imu_mag_output,
+            pressure_output: pressure_reader.try_get(),
+            other: Some(OtherData::get()),
+            localization_output: imu_mag_output.map(|output| 
+                LocalizationOutput::new(Vec3::ZERO, Vec3::ZERO, output.ori)
+            )
+        };
+
+        Message::from(data_chunk).send().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn calibration_task() {
+    // get spawned when calibration is requested
+
+    loop {
+        // Wait for calibration start event
+        // Print instructions to screen
+    }
+
+    loop {
+        // Wait for calibration settings to be received
+        // Print instructions to screen
+    }
+
+    loop {
+        // Perform calibration
+        // Print progress to screen
+    }
+    // Send calibration results back to main loop
+
+    loop {
+        // Wait for calibration results to be sent back
+        // Print instructions to screen
+    }
+    // Enter back to CalibrationState::NotCalibrating state
+}
+
+#[embassy_executor::task]
+async fn track_connectivity() {
+    loop {
+        // send echo
+
+        // wait for response
+
+        // update connectivity state if response was received or not
+    }
+}

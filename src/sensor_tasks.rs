@@ -12,6 +12,8 @@ use glam::{Vec3, Quat};
 use mmc5983_rs::Mmc5983;
 use ms5837::OverSamplingRatio;
 
+use crate::comms::Messagable;
+
 pub static PRESSURE_RESULTS: Watch<CriticalSectionRawMutex, PressureResults, 4> = Watch::new();
 pub static IMU_MAG_RESULTS: Watch<CriticalSectionRawMutex, ImuMagResults, 4> = Watch::new();
 
@@ -31,6 +33,59 @@ pub struct ImuMagResults {
     pub imu_temp: f32,
     pub mag_temp: f32,
     pub ori: Quat
+}
+
+/* c++ versions
+
+void AK09940A_Output::into_message(std::vector<uint8_t> &data) {
+	for (int i = 0; i < 3; i++) {
+		uint32_t data_val = (uint32_t)static_cast<int32_t>(mag[i]);
+		data.push_back((uint8_t)(data_val >> 24));
+		data.push_back((uint8_t)((data_val >> 16) & 0xFF));
+		data.push_back((uint8_t)((data_val >> 8) & 0xFF));
+		data.push_back((uint8_t)(data_val & 0xFF));
+	}
+}
+    void ICM42688_Data::into_message(std::vector<uint8_t> &data) {
+	uint8_t msg_data[12];
+
+	for (int i = 0; i < 3; i++) {
+		uint16_t acc_data = (uint16_t)static_cast<int16_t>(acc[i] * 4096.0);
+		uint16_t gyr_data = (uint16_t)static_cast<int16_t>(gyro[i] * 4096.0);
+		msg_data[0 + 2*i] = (uint8_t)(acc_data >> 8);
+		msg_data[1 + 2*i] = (uint8_t)(acc_data & 0xFF);
+		msg_data[6 + 2*i] = (uint8_t)(gyr_data >> 8);
+		msg_data[7 + 2*i] = (uint8_t)(gyr_data & 0xFF);
+	}
+	
+	data.insert(data.end(), msg_data, msg_data + 12);
+}
+*/
+
+impl Messagable for ImuMagResults {
+    fn insert_msg_bytes(&self, dst: &mut [u8]) -> usize {
+        for i in 0..3 {
+            let mag_data = (100000.0 * self.mag[i]) as i32;
+
+            dst[4*i..4*(i+1)].copy_from_slice(&mag_data.to_be_bytes());
+        }
+
+        for i in 0..3 {
+            let acc_data = (self.acc[i] * 4096.0) as i16;
+            let gyr_data = (self.gyr[i] * 4096.0) as i16;
+
+            dst[12 + 2*i] = (acc_data >> 8) as u8;
+            dst[13 + 2*i] = (acc_data & 0xFF) as u8;
+            dst[18 + 2*i] = (gyr_data >> 8) as u8;
+            dst[19 + 2*i] = (gyr_data & 0xFF) as u8;
+        }
+        24 // Return the number of bytes written    
+    }
+
+    fn try_from_msg_bytes(_src: &[u8]) -> Option<Self> {
+        None // TODO: Implement this if needed
+    }
+
 }
 
 
@@ -66,7 +121,7 @@ pub async fn icm42688p_mmc5983_sender(
     use glam::Vec3;
 
     let sender = IMU_MAG_RESULTS.sender();
-    let mut ticker = Ticker::every(Duration::from_hz(100));
+    let mut ticker = Ticker::every(Duration::from_hz(800));
 
     // Adjust these to match your configured full-scale range
     let accel_lsb = 16.0f32 / (1 << 19) as f32; // g per LSB, e.g. ±16g
@@ -76,7 +131,7 @@ pub async fn icm42688p_mmc5983_sender(
     // // ICM42688P
     let icm = icm426xx::ICM42688::new(icm_spidev);
     let mut icm_config = icm426xx::Config::default();
-    icm_config.rate = OutputDataRate::Hz500;
+    icm_config.rate = OutputDataRate::Hz2000;
     let icm_opt = match icm.initialize(Delay, icm_config).await {
         Ok(mut icm) => {
             info!("ICM Init Success!!");
@@ -129,6 +184,7 @@ pub async fn icm42688p_mmc5983_sender(
         }
     };
 
+
     let mag_strength = match mmc.magnetic_field().await {
         Ok(field) => Vec3::new(
             field.x_gauss(), 
@@ -143,10 +199,22 @@ pub async fn icm42688p_mmc5983_sender(
 
     info!("MMC, offset: {:?}", offset.to_array());
 
+    match mmc.set_bandwidth(mmc5983_rs::BandwidthMode::Hz800).await {
+        Ok(_) => {},
+        Err(e) => {
+            info!("MMC error setting bandwidth to __: {:?}", e)
+        }
+    }
+
     let mut imu_mag_res = ImuMagResults::default();
     imu_mag_res.mag_strength = mag_strength;
     let mut now = embassy_time::Instant::now();
     let tuning_parameter = 0.1;
+
+    const N: usize = 10;
+    let mut prev_mag = [Vec3::ZERO; N];
+    let mut mags = [Vec3::ZERO; N];
+    let mut i = 0;
 
     loop {
         ticker.next().await;
@@ -154,11 +222,18 @@ pub async fn icm42688p_mmc5983_sender(
         // MMC
         match mmc.magnetic_field().await {
             Ok(field) => {
-                imu_mag_res.mag = Vec3::new(
+                let mag = Vec3::new(
                     field.x_gauss() - offset.x,
                     field.y_gauss() - offset.y,
                     field.z_gauss() - offset.z,
                 );
+
+                prev_mag[i] = mag;
+                i = (i+1) % N;
+
+                mags = prev_mag.clone();
+                mags = sort_arr(mags, |v1, v2| v1.x > v2.x);
+                imu_mag_res.mag = mags[N/2];
 
                 imu_mag_res.mag_strength = imu_mag_res.mag.length();
 
@@ -219,13 +294,56 @@ pub async fn icm42688p_mmc5983_sender(
     //		pos += vel * dt_s;
         }
 
-        // info!("SENDING IMU");
+        // info!("SENDING IMU: \n  [{}, {}, {}]\n  [{}, {}, {}]\n  [{}, {}, {}]", 
+        //     imu_mag_res.acc.x, imu_mag_res.acc.y, imu_mag_res.acc.z,
+        //     imu_mag_res.gyr.x, imu_mag_res.gyr.y, imu_mag_res.gyr.z,
+        //     imu_mag_res.mag.x, imu_mag_res.mag.y, imu_mag_res.mag.z
+        // );
         sender.send(imu_mag_res.clone());
 	    now = embassy_time::Instant::now();
     }
 }
 
+fn sort_arr<const N: usize>(mut vs: [Vec3; N], f_gt: impl Fn(&Vec3, &Vec3) -> bool) -> [Vec3; N] {
+    for i in 0..N {
+        for j in 1..(N-i) {
+            if f_gt(&vs[j-1], &vs[j]) {
+                let v_temp = vs[j-1];
+                vs[j-1] = vs[j];
+                vs[j] = v_temp;
+            }
+        }
+    }
+
+    vs
+}
+
 const MBAR_PER_ATM: f32 = 1013.25;
+
+
+impl Messagable for PressureResults {
+    fn insert_msg_bytes(&self, dst: &mut [u8]) -> usize {
+        let floats: [f32; 3] = [
+            10.36 * (self.pressure_atm - 1.0),// depth (m)
+            self.sensor_temp,// temperature (C)
+            MBAR_PER_ATM * self.pressure_atm// pressure (mbar)
+        ];
+
+        for i in 0..3 {
+            let uint32_data = floats[i].to_bits();
+
+            dst[4*i] = (uint32_data >> 24) as u8;
+            dst[1 + 4*i] = ((uint32_data >> 16) & 0xFF) as u8;
+            dst[2 + 4*i] = ((uint32_data >> 8) & 0xFF) as u8;
+            dst[3 + 4*i] = (uint32_data & 0xFF) as u8;
+        }
+        12 // Return the number of bytes written
+    }
+
+    fn try_from_msg_bytes(_src: &[u8]) -> Option<Self> {
+        None // TODO: Implement this if needed
+    }
+}
 
 #[embassy_executor::task]
 pub async fn ms5837_test(i2c: I2c<'static, Async, i2c::Master>) {

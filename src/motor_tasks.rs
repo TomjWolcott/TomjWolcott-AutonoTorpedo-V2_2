@@ -6,13 +6,14 @@ use embassy_stm32::timer::simple_pwm::{SimplePwm, SimplePwmChannels};
 use embassy_stm32::peripherals::{TIM1, TIM2, TIM3};
 use embassy_sync::watch::Watch;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use serde::{Deserialize, Serialize};
+use embassy_time::{Duration, Timer};
 
 use crate::adc_tasks::ADC_RESULTS;
+use crate::comms::Messagable;
 
-pub static MOTOR_INPUTS: Watch<CriticalSectionRawMutex, MotorInputs, 4> = Watch::new();
+pub static MOTOR_INPUTS: Watch<CriticalSectionRawMutex, MotorInputs, 2> = Watch::new();
 
-#[derive(Default, Clone, Copy, Format, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, Format, Debug)]
 pub struct MotorInputs {
     pub speeds: [f32; 4],
     pub gainsels: [GainselState; 4]
@@ -32,7 +33,7 @@ impl MotorInputs {
     }
 }
 
-#[derive(Default, Clone, Copy, Format, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, Format, Debug)]
 pub enum GainselState {
     #[default]
     HighCurrent = 0,
@@ -48,6 +49,14 @@ impl GainselState {
             GainselState::HighCurrent => 0,
         }
     }
+}
+
+// TODO: Add more complex characterization here: Speed vs. input curve etc.
+#[derive(Clone, Copy, Format)]
+pub struct MotorCharacterization {
+    minimum_speed: f32, // Range: [0.0, 1.0] before multiplier
+    multiplier: f32, // Range: (-Inf, Inf)
+    index: MotorIndex
 }
 
 #[derive(Clone, Copy, Format)]
@@ -66,16 +75,20 @@ impl MotorId {
     }
 }
 
-const MOTOR_MAP: [MotorIndex; 4] = [
-    MotorIndex::M0,
-    MotorIndex::M1,
-    MotorIndex::M2,
-    MotorIndex::M3
+const MOTOR_CHARACTERIZATIONS: [MotorCharacterization; 4] = [
+    MotorCharacterization { minimum_speed: 0.6, multiplier: -1.0, index: MotorIndex::M3 }, // TL
+    MotorCharacterization { minimum_speed: 0.6, multiplier: 1.0, index: MotorIndex::M1 }, // TR
+    MotorCharacterization { minimum_speed: 0.6, multiplier: 1.0, index: MotorIndex::M2 }, // BL
+    MotorCharacterization { minimum_speed: 0.6, multiplier: -1.0, index: MotorIndex::M0 },  // BR
 ];
+
+fn motor(id: MotorId) -> MotorCharacterization {
+    MOTOR_CHARACTERIZATIONS[id.num()]
+}
 
 impl Into<MotorIndex> for MotorId {
     fn into(self) -> MotorIndex {
-        MOTOR_MAP[self as usize]
+        motor(self).index
     }
 }
 
@@ -93,11 +106,26 @@ impl MotorIndex {
             MotorIndex::M3 => 3
         }
     }
+
+    fn from_num(n: usize) -> Option<Self> {
+        match n {
+            0 => Some(MotorIndex::M0),
+            1 => Some(MotorIndex::M1),
+            2 => Some(MotorIndex::M2),
+            3 => Some(MotorIndex::M3),
+            _ => None
+        }
+    }
+}
+
+impl MotorIndex {
+    const VARIANTS: [Self; 4] = [Self::M0, Self::M1, Self::M2, Self::M3];
 }
 
 pub struct MotorControllersPeri {
     gainsels: [Flex<'static>; 4],
     gainsel_states: [GainselState; 4],
+    prev_speeds: [f32; 4],
     ipropi_indexes: [u32; 4],
     m0_channels: SimplePwmChannels<'static, TIM1>, // CH3 = m0_forward, CH4 = m0_reverse
     m1_channels: SimplePwmChannels<'static, TIM2>, // CH3 = m1_forward, CH4 = m1_reverse
@@ -127,6 +155,7 @@ impl MotorControllersPeri {
             gainsels,
             gainsel_states: [GainselState::HighCurrent; 4],
             ipropi_indexes,
+            prev_speeds: [0.0; 4],
             m0_channels: t1.split(),
             m1_channels: t2.split(),
             m2_m3_channels: t3.split(),
@@ -149,13 +178,27 @@ impl MotorControllersPeri {
         self.m2_m3_channels.ch4.set_duty_cycle_fully_off();
     }
 
-    pub fn set_motor_speed(&mut self, motor_index: MotorIndex, speed: f32) {
+    pub async fn set_motor_speed(&mut self, motor_index: MotorIndex, speed: f32) {
+        let prev_speed = self.prev_speeds[motor_index.num()];
+        let is_forward = speed > 0.0;
+        if speed.abs() > 0.0 { info!("Setting motor {:?} speed to {}, prev: [{:?}]", motor_index, speed, self.prev_speeds);} 
+
+        // if (prev_speed.abs() <= 0.6 || (speed * prev_speed) < 0.0) && speed.abs() > 0.0 {
+        //     info!("HIT: prev_speed: {}, speed: {}", prev_speed, speed);
+        //     self.set_motor_speed_raw(motor_index, 100, is_forward);
+        //     Timer::after(Duration::from_millis(2)).await;  // TODO: There are sometimes race conditions here!!!
+        // }
+
+        self.prev_speeds[motor_index.num()] = speed;
         let speed_u8 = ((100.0 * speed.abs()) as u8) % 101;
 
-        info!("Setting motor {:?} speed to {} ({}%)", motor_index, speed, speed_u8);
+        self.set_motor_speed_raw(motor_index, speed_u8, is_forward);
+    }
+
+    fn set_motor_speed_raw(&mut self, motor_index: MotorIndex, speed_u8: u8, is_forward: bool) {
         match motor_index {
             MotorIndex::M0 => {
-                if speed > 0.0 {
+                if is_forward {
                     self.m0_channels.ch3.set_duty_cycle_percent(speed_u8);
                     self.m0_channels.ch4.set_duty_cycle_fully_off();
                 } else {
@@ -164,7 +207,7 @@ impl MotorControllersPeri {
                 }
             },
             MotorIndex::M1 => {
-                if speed > 0.0 {
+                if is_forward {
                     self.m1_channels.ch3.set_duty_cycle_percent(speed_u8);
                     self.m1_channels.ch4.set_duty_cycle_fully_off();
                 } else {
@@ -173,7 +216,7 @@ impl MotorControllersPeri {
                 }
             },
             MotorIndex::M2 => {
-                if speed > 0.0 {
+                if is_forward {
                     self.m2_m3_channels.ch1.set_duty_cycle_percent(speed_u8);
                     self.m2_m3_channels.ch2.set_duty_cycle_fully_off();
                 } else {
@@ -182,7 +225,7 @@ impl MotorControllersPeri {
                 }
             },
             MotorIndex::M3 => {
-                if speed > 0.0 {
+                if is_forward {
                     self.m2_m3_channels.ch3.set_duty_cycle_percent(speed_u8);
                     self.m2_m3_channels.ch4.set_duty_cycle_fully_off();
                 } else {
@@ -193,7 +236,11 @@ impl MotorControllersPeri {
         }
     }
 
-    pub fn set_gainsel(&mut self, motor_index: MotorIndex, gainsel_state: GainselState) {
+    pub fn set_gainsel(&mut self, motor_index: MotorIndex, _gainsel_state: GainselState) {
+        //   TODO: Acutally let gainsel change, this is to prevent the situation where
+        // the stated gainsel does not match what the motor driver sees causing motor 
+        // current to be calculated incorrectly.
+        let gainsel_state = GainselState::HighCurrent;
         match gainsel_state {
             GainselState::LowCurrent => {
                 self.gainsels[motor_index.num()].set_level(Level::High);
@@ -219,10 +266,10 @@ impl MotorControllersPeri {
         self.set_gainsel(MotorIndex::M3, gainsel_state);
     }
 
-    pub fn set_from_inputs(&mut self, inputs: &MotorInputs) {
+    pub async fn set_from_inputs(&mut self, inputs: &MotorInputs) {
         for i in 0..4 {
-            self.set_motor_speed(MOTOR_MAP[i], inputs.speeds[i]);
-            self.set_gainsel(MOTOR_MAP[i], inputs.gainsels[i]);
+            self.set_motor_speed(MotorIndex::from_num(i).unwrap(), inputs.speeds[i]).await;
+            // self.set_gainsel(MotorIndex::from_num(i).unwrap(), inputs.gainsels[i]);
         }
     }
 }
@@ -237,7 +284,7 @@ pub async fn motor_controller_test(
     loop {
         let motor_inputs = rx.changed().await;
 
-        motor_controller.set_from_inputs(&motor_inputs);
+        motor_controller.set_from_inputs(&motor_inputs).await;
 
         // if let Some(adc_results) = adc_reader.try_get() {
         //     info!("adc_results: {:?}", adc_results);
@@ -245,4 +292,65 @@ pub async fn motor_controller_test(
 
         // info!("motor_inputs: {:?}", motor_inputs);
     }
+}
+
+#[derive(Clone, Copy, Format, Default)]
+pub struct MotorStats {
+    pub motor_a: [f32; 4],
+    pub motor_v: [f32; 4],
+    pub motor_ins: [f32; 4],
+}
+
+impl Messagable for MotorStats {
+    fn insert_msg_bytes(&self, dst: &mut [u8]) -> usize {
+        let mut motor_a_data: [u32; 4] = [0; 4];
+        let mut motor_v_data: [u32; 4] = [0; 4];
+        let mut motor_ins_data: [u32; 4] = [0; 4];
+
+        for i in 0..4 {
+            motor_a_data[i] = (65536.0 * self.motor_a[i] / 8.0) as u32;
+            motor_v_data[i] = (65536.0 * self.motor_v[i] / 8.0) as u32;
+            motor_ins_data[i] = (65536.0 * (self.motor_ins[i] + 1.0) / 2.0) as u32;
+        }
+
+        dst[0..8].copy_from_slice(&[
+            ((motor_a_data[0] >> 8) & 0xFF) as u8,
+            (motor_a_data[0] & 0xFF) as u8,
+            ((motor_a_data[1] >> 8) & 0xFF) as u8,
+            (motor_a_data[1] & 0xFF) as u8,
+            ((motor_a_data[2] >> 8) & 0xFF) as u8,
+            (motor_a_data[2] & 0xFF) as u8,
+            ((motor_a_data[3] >> 8) & 0xFF) as u8,
+            (motor_a_data[3] & 0xFF) as u8
+        ]);
+
+        dst[8..16].copy_from_slice(&[
+            ((motor_v_data[0] >> 8) & 0xFF) as u8,
+            (motor_v_data[0] & 0xFF) as u8,
+            ((motor_v_data[1] >> 8) & 0xFF) as u8,
+            (motor_v_data[1] & 0xFF) as u8,
+            ((motor_v_data[2] >> 8) & 0xFF) as u8,
+            (motor_v_data[2] & 0xFF) as u8,
+            ((motor_v_data[3] >> 8) & 0xFF) as u8,
+            (motor_v_data[3] & 0xFF) as u8
+        ]);
+
+        dst[16..24].copy_from_slice(&[
+            ((motor_ins_data[0] >> 8) & 0xFF) as u8,
+            (motor_ins_data[0] & 0xFF) as u8,
+            ((motor_ins_data[1] >> 8) & 0xFF) as u8,
+            (motor_ins_data[1] & 0xFF) as u8,
+            ((motor_ins_data[2] >> 8) & 0xFF) as u8,
+            (motor_ins_data[2] & 0xFF) as u8,
+            ((motor_ins_data[3] >> 8) & 0xFF) as u8,
+            (motor_ins_data[3] & 0xFF) as u8
+        ]);
+
+        24
+    }
+
+    fn try_from_msg_bytes(_src: &[u8]) -> Option<Self> {
+        None // TODO: Implement this if needed
+    }
+
 }
